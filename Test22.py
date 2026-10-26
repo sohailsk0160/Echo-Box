@@ -106,17 +106,32 @@ class EmailOrganizer:
                 sender = email.utils.parseaddr(email_message['From'])[1]
                 analytics['sender_frequency'][sender] += 1
 
-                date_tuple = email.utils.parsedate_tz(email_message['Date'])
-                if date_tuple:
-                    local_date = datetime.fromtimestamp(email.utils.mktime_tz(date_tuple))
+                # Date headers are optional and may be malformed. Only perform
+                # time-based analytics when the message has a usable timestamp.
+                local_date = None
+                try:
+                    date_tuple = email.utils.parsedate_tz(email_message.get('Date'))
+                    if date_tuple:
+                        local_date = datetime.fromtimestamp(
+                            email.utils.mktime_tz(date_tuple)
+                        )
+                except (TypeError, ValueError, OverflowError):
+                    local_date = None
+
+                if local_date is not None:
                     analytics['hourly_distribution'][local_date.hour] += 1
 
-                if email_message['In-Reply-To']:
-                    if last_received_time:
-                        response_time = (local_date - last_received_time).total_seconds() / 60
-                        total_response_time += response_time
-                        response_count += 1
-                last_received_time = local_date
+                    if email_message.get('In-Reply-To') and last_received_time is not None:
+                        response_time = (
+                            local_date - last_received_time
+                        ).total_seconds() / 60
+
+                        # Ignore negative values caused by out-of-order messages.
+                        if response_time >= 0:
+                            total_response_time += response_time
+                            response_count += 1
+
+                    last_received_time = local_date
 
                 subject = email_message['Subject']
                 if subject:
@@ -182,21 +197,45 @@ class EmailOrganizer:
             return f"Error processing emails: {str(e)}"
 
     def match_rule(self, email_message, rule):
-        if rule['condition_type'] == 'from':
-            return rule['condition_value'].lower() in email_message['From'].lower()
-        elif rule['condition_type'] == 'subject':
-            return rule['condition_value'].lower() in email_message['Subject'].lower()
-        elif rule['condition_type'] == 'body':
-            return self.check_body_content(email_message, rule['condition_value'])
+        """Match an email against a rule without assuming headers exist."""
+        condition_type = rule.get('condition_type', '')
+        condition_value = str(rule.get('condition_value', '')).casefold()
+
+        if not condition_value:
+            return False
+        if condition_type == 'from':
+            return condition_value in str(email_message.get('From', '')).casefold()
+        if condition_type == 'subject':
+            return condition_value in str(email_message.get('Subject', '')).casefold()
+        if condition_type == 'body':
+            return self.check_body_content(email_message, condition_value)
         return False
 
     def check_body_content(self, email_message, keyword):
-        if email_message.is_multipart():
-            for part in email_message.walk():
-                if part.get_content_type() == "text/plain":
-                    return keyword.lower() in part.get_payload().lower()
-        else:
-            return keyword.lower() in email_message.get_payload().lower()
+        """Search decoded text parts, handling multipart and missing payloads."""
+        keyword = str(keyword).casefold()
+        if not keyword:
+            return False
+
+        parts = email_message.walk() if email_message.is_multipart() else (email_message,)
+        for part in parts:
+            if part.get_content_maintype() == 'multipart':
+                continue
+            if part.get_content_type() not in ('text/plain', 'text/html'):
+                continue
+
+            try:
+                content = part.get_content()
+            except (LookupError, UnicodeError, AttributeError):
+                payload = part.get_payload(decode=True)
+                if payload is None:
+                    continue
+                charset = part.get_content_charset() or 'utf-8'
+                content = payload.decode(charset, errors='replace')
+
+            if isinstance(content, str) and keyword in content.casefold():
+                return True
+        return False
 
     def send_auto_reply(self, email_message):
         sender = email.utils.parseaddr(email_message['From'])[1]
@@ -232,14 +271,25 @@ class EmailOrganizer:
                 email_body = msg_data[0][1]
                 email_message = email.message_from_bytes(email_body)
 
-                subject = email_message['Subject']
-                sender = email.utils.parseaddr(email_message['From'])[1]
-                date = email.utils.parsedate_to_datetime(email_message['Date'])
+                subject = email_message.get('Subject') or '(No subject)'
+                sender = email.utils.parseaddr(email_message.get('From', ''))[1]
+
+                # Search results should remain usable even when a Date header is
+                # absent or invalid.
+                formatted_date = 'Unknown'
+                try:
+                    parsed_date = email.utils.parsedate_to_datetime(
+                        email_message.get('Date', '')
+                    )
+                    if parsed_date is not None:
+                        formatted_date = parsed_date.strftime("%Y-%m-%d %H:%M:%S")
+                except (TypeError, ValueError, OverflowError):
+                    pass
 
                 results.append({
                     'subject': subject,
                     'sender': sender,
-                    'date': date.strftime("%Y-%m-%d %H:%M:%S")
+                    'date': formatted_date
                 })
 
             return results
@@ -250,7 +300,8 @@ class AnalyticsWindow:
     def __init__(self, parent, analytics, is_dark_mode=True):
         self.window = ttkb.Toplevel(parent)
         self.window.title("Email Analytics")
-        self.window.geometry("1200x800")
+        self.window.geometry("1280x850")
+        self.window.minsize(1000, 680)
         self.analytics = analytics
         self.is_dark_mode = is_dark_mode
         
@@ -1044,7 +1095,7 @@ class EmailOrganizerGUI:
         # Add a placeholder message
         placeholder = ttk.Label(
             self.analytics_frame,
-            text="Click 'Analyze Emails' to view your email analytics",
+            text="Your inbox insights will appear here. Connect your email, then select Analyze Emails.",
             font=("Helvetica", 12),
             foreground="#888888"
         )
