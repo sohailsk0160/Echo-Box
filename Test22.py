@@ -106,11 +106,13 @@ class EmailOrganizer:
                 sender = email.utils.parseaddr(email_message['From'])[1]
                 analytics['sender_frequency'][sender] += 1
 
-                # Date headers are optional and may be malformed. Only perform
-                # time-based analytics when the message has a usable timestamp.
+                # Date headers can be missing or malformed. Keep the email in
+                # the overall analytics, but only calculate time-based metrics
+                # when a valid timestamp is available.
                 local_date = None
                 try:
-                    date_tuple = email.utils.parsedate_tz(email_message.get('Date'))
+                    date_header = email_message.get('Date')
+                    date_tuple = email.utils.parsedate_tz(date_header) if date_header else None
                     if date_tuple:
                         local_date = datetime.fromtimestamp(
                             email.utils.mktime_tz(date_tuple)
@@ -126,7 +128,7 @@ class EmailOrganizer:
                             local_date - last_received_time
                         ).total_seconds() / 60
 
-                        # Ignore negative values caused by out-of-order messages.
+                        # Ignore negative intervals from messages arriving out of order.
                         if response_time >= 0:
                             total_response_time += response_time
                             response_count += 1
@@ -197,45 +199,21 @@ class EmailOrganizer:
             return f"Error processing emails: {str(e)}"
 
     def match_rule(self, email_message, rule):
-        """Match an email against a rule without assuming headers exist."""
-        condition_type = rule.get('condition_type', '')
-        condition_value = str(rule.get('condition_value', '')).casefold()
-
-        if not condition_value:
-            return False
-        if condition_type == 'from':
-            return condition_value in str(email_message.get('From', '')).casefold()
-        if condition_type == 'subject':
-            return condition_value in str(email_message.get('Subject', '')).casefold()
-        if condition_type == 'body':
-            return self.check_body_content(email_message, condition_value)
+        if rule['condition_type'] == 'from':
+            return rule['condition_value'].lower() in email_message['From'].lower()
+        elif rule['condition_type'] == 'subject':
+            return rule['condition_value'].lower() in email_message['Subject'].lower()
+        elif rule['condition_type'] == 'body':
+            return self.check_body_content(email_message, rule['condition_value'])
         return False
 
     def check_body_content(self, email_message, keyword):
-        """Search decoded text parts, handling multipart and missing payloads."""
-        keyword = str(keyword).casefold()
-        if not keyword:
-            return False
-
-        parts = email_message.walk() if email_message.is_multipart() else (email_message,)
-        for part in parts:
-            if part.get_content_maintype() == 'multipart':
-                continue
-            if part.get_content_type() not in ('text/plain', 'text/html'):
-                continue
-
-            try:
-                content = part.get_content()
-            except (LookupError, UnicodeError, AttributeError):
-                payload = part.get_payload(decode=True)
-                if payload is None:
-                    continue
-                charset = part.get_content_charset() or 'utf-8'
-                content = payload.decode(charset, errors='replace')
-
-            if isinstance(content, str) and keyword in content.casefold():
-                return True
-        return False
+        if email_message.is_multipart():
+            for part in email_message.walk():
+                if part.get_content_type() == "text/plain":
+                    return keyword.lower() in part.get_payload().lower()
+        else:
+            return keyword.lower() in email_message.get_payload().lower()
 
     def send_auto_reply(self, email_message):
         sender = email.utils.parseaddr(email_message['From'])[1]
@@ -271,10 +249,10 @@ class EmailOrganizer:
                 email_body = msg_data[0][1]
                 email_message = email.message_from_bytes(email_body)
 
-                subject = email_message.get('Subject') or '(No subject)'
+                subject = email_message.get('Subject', '(No subject)')
                 sender = email.utils.parseaddr(email_message.get('From', ''))[1]
 
-                # Search results should remain usable even when a Date header is
+                # Search should still return the email when its Date header is
                 # absent or invalid.
                 formatted_date = 'Unknown'
                 try:
@@ -301,7 +279,7 @@ class AnalyticsWindow:
         self.window = ttkb.Toplevel(parent)
         self.window.title("Email Analytics")
         self.window.geometry("1280x850")
-        self.window.minsize(1000, 680)
+        self.window.minsize(900, 620)
         self.analytics = analytics
         self.is_dark_mode = is_dark_mode
         
@@ -847,16 +825,18 @@ class EmailOrganizerGUI:
         self.organizer = EmailOrganizer()
         self.window = ttkb.Window(themename="superhero")  # Changed theme for a modern look
         self.window.title("Echo-Box")
-        self.window.geometry("1200x800")
+        # Start with a comfortable desktop size while allowing smaller screens.
+        self.window.geometry("1360x860")
+        self.window.minsize(1040, 700)
         self.auto_reply_var = tk.BooleanVar(value=self.organizer.auto_reply_settings['enabled'])
         self.auto_reply_message = tk.Text()
-        self.is_dark_mode = True  # Start with dark mode
-        
-        # Create icons first, before they're needed
+        self.is_dark_mode = True
+
+        # Apply shared design tokens before widgets are created.
+        self.apply_visual_styles()
         self.create_icons()
-        
-        # Then set up the GUI
         self.setup_gui()
+        self.bind_keyboard_shortcuts()
 
     def create_icons(self):
         # Create simple icons using PIL if not available
@@ -931,6 +911,51 @@ class EmailOrganizerGUI:
             reply_icon.putpixel((10+i, 16-i), (255, 255, 255, 255))
         self.icons['reply'] = ImageTk.PhotoImage(reply_icon)
 
+    def apply_visual_styles(self):
+        """Apply a consistent dark/light design system across all screens."""
+        style = self.window.style
+        if self.is_dark_mode:
+            c = {"app": "#17212f", "sidebar": "#111a27", "surface": "#223247",
+                 "surface_alt": "#293b51", "text": "#edf3fa", "muted": "#a9b8ca",
+                 "accent": "#4f9cf9", "success": "#35b56a"}
+        else:
+            c = {"app": "#f3f6fb", "sidebar": "#e7edf5", "surface": "#ffffff",
+                 "surface_alt": "#f5f8fc", "text": "#1e293b", "muted": "#64748b",
+                 "accent": "#2563eb", "success": "#16834a"}
+        self.ui_colors = c
+        style.configure("TFrame", background=c["app"])
+        style.configure("TLabel", background=c["app"], foreground=c["text"], font=("Segoe UI", 10))
+        style.configure("PageTitle.TLabel", background=c["app"], foreground=c["text"], font=("Segoe UI", 23, "bold"))
+        style.configure("PageSubtitle.TLabel", background=c["app"], foreground=c["muted"], font=("Segoe UI", 10))
+        style.configure("Card.TFrame", background=c["surface"], relief="solid", borderwidth=1)
+        style.configure("CardInner.TFrame", background=c["surface"], relief="flat", borderwidth=0)
+        style.configure("InnerCard.TFrame", background=c["surface_alt"], relief="flat", borderwidth=0)
+        style.configure("CardTitle.TLabel", background=c["surface"], foreground=c["text"], font=("Segoe UI", 12, "bold"))
+        style.configure("CardHint.TLabel", background=c["surface"], foreground=c["muted"], font=("Segoe UI", 9))
+        style.configure("Sidebar.TFrame", background=c["sidebar"])
+        style.configure("SidebarBtn.TFrame", background=c["sidebar"])
+        style.configure("SidebarTitle.TLabel", background=c["sidebar"], foreground=c["text"], font=("Segoe UI", 18, "bold"))
+        style.configure("ConnectionStatus.TLabel", background=c["sidebar"], foreground=c["success"], font=("Segoe UI", 9, "bold"))
+        style.configure("TNotebook", background=c["app"], borderwidth=0, tabmargins=(3, 5, 3, 0))
+        style.configure("TNotebook.Tab", padding=(16, 10), font=("Segoe UI", 10))
+        style.configure("Treeview", rowheight=32, font=("Segoe UI", 10), background=c["surface"], fieldbackground=c["surface"], foreground=c["text"], borderwidth=0)
+        style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"), padding=(8, 8))
+        style.map("Treeview", background=[("selected", c["accent"])], foreground=[("selected", "#ffffff")])
+        style.configure("StatusBar.TLabel", background=c["sidebar"], foreground=c["muted"], padding=(12, 7), font=("Segoe UI", 9))
+        style.configure("Success.TFrame", background=c["success"])
+        style.configure("Info.TFrame", background=c["accent"])
+        style.configure("Warning.TFrame", background="#e5a23b")
+        style.configure("Danger.TFrame", background="#dc5555")
+        style.configure("Primary.TFrame", background=c["accent"])
+
+    def bind_keyboard_shortcuts(self):
+        """Convenient keyboard shortcuts for common navigation actions."""
+        for index in range(5):
+            self.window.bind_all(f"<Control-Key-{index + 1}>", lambda event, idx=index: self.notebook.select(idx))
+        self.window.bind_all("<Control-d>", lambda event: self.toggle_dark_mode())
+        self.window.bind_all("<Control-l>", lambda event: self.show_login_dialog())
+        self.window.bind_all("<F5>", lambda event: self.notebook.select(0))
+
     def setup_gui(self):
         self.create_menu()
         self.create_sidebar()
@@ -957,9 +982,10 @@ class EmailOrganizerGUI:
         help_menu.add_command(label="Documentation", command=self.open_documentation)
 
     def create_sidebar(self):
-        # Create a sidebar frame
-        self.sidebar = ttk.Frame(self.window, style="Sidebar.TFrame")
+        # Keep navigation at a consistent width so the content area can resize.
+        self.sidebar = ttk.Frame(self.window, style="Sidebar.TFrame", width=220)
         self.sidebar.pack(side=tk.LEFT, fill=tk.Y, padx=0, pady=0)
+        self.sidebar.pack_propagate(False)
         
         # App title
         title_frame = ttk.Frame(self.sidebar, style="Sidebar.TFrame")
@@ -1012,18 +1038,14 @@ class EmailOrganizerGUI:
         return btn
 
     def create_main_content(self):
-        # Create a main content frame
-        self.main_content = ttk.Frame(self.window)
+        # Main workspace expands with the window; shared styles keep screens consistent.
+        self.main_content = ttk.Frame(self.window, padding=(4, 4, 8, 4))
         self.main_content.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
-        
-        # Create notebook in main content
+
+        # A modest outer gutter avoids cramped edges without wasting screen space.
         self.notebook = ttk.Notebook(self.main_content, style="TNotebook")
-        self.notebook.pack(expand=True, fill=tk.BOTH, padx=20, pady=20)
-        
-        # Apply custom styling to tabs
-        style = ttkb.Style()
-        style.configure('TNotebook.Tab', padding=(15, 10), font=('Helvetica', 11))
-        
+        self.notebook.pack(expand=True, fill=tk.BOTH, padx=12, pady=(10, 8))
+
         self.create_dashboard_tab()
         self.create_rules_tab()
         self.create_search_tab()
@@ -1031,34 +1053,47 @@ class EmailOrganizerGUI:
         self.create_auto_reply_tab()
 
     def create_dashboard_tab(self):
-        dashboard_frame = ttk.Frame(self.notebook)
+        dashboard_frame = ttk.Frame(self.notebook, padding=(8, 8, 8, 10))
         self.notebook.add(dashboard_frame, text="Dashboard")
-        
-        # Header with welcome message
+
+        # Page heading and supporting text establish a clearer visual hierarchy.
         header_frame = ttk.Frame(dashboard_frame)
-        header_frame.pack(fill=tk.X, padx=20, pady=20)
-        
+        header_frame.pack(fill=tk.X, padx=14, pady=(12, 16))
+
         ttk.Label(
-            header_frame, 
-            text="Email Analytics Dashboard", 
-            font=("Helvetica", 20, "bold")
-        ).pack(side=tk.LEFT)
-        
-        # Action buttons in a card-like container
-        action_frame = ttk.Frame(dashboard_frame, style="Card.TFrame")
-        action_frame.pack(fill=tk.X, padx=20, pady=10)
-        
-        # Add a subtle header to the card
+            header_frame,
+            text="Email Analytics Dashboard",
+            style="PageTitle.TLabel"
+        ).pack(anchor=tk.W)
+
         ttk.Label(
-            action_frame, 
-            text="Quick Actions", 
-            font=("Helvetica", 14, "bold"),
+            header_frame,
+            text="Understand your inbox, organize messages, and stay on top of replies.",
+            style="PageSubtitle.TLabel"
+        ).pack(anchor=tk.W, pady=(5, 0))
+
+        # Quick actions are grouped in a compact card.
+        action_frame = ttk.Frame(dashboard_frame, style="Card.TFrame", padding=18)
+        action_frame.pack(fill=tk.X, padx=14, pady=(0, 14))
+
+        action_header = ttk.Frame(action_frame, style="CardInner.TFrame")
+        action_header.pack(fill=tk.X, pady=(0, 12))
+
+        ttk.Label(
+            action_header,
+            text="Quick Actions",
             style="CardTitle.TLabel"
-        ).pack(anchor=tk.W, padx=20, pady=(20, 10))
-        
-        button_frame = ttk.Frame(action_frame)
-        button_frame.pack(padx=20, pady=(0, 20))
-        
+        ).pack(side=tk.LEFT)
+
+        ttk.Label(
+            action_header,
+            text="Run a task on your connected inbox",
+            style="CardHint.TLabel"
+        ).pack(side=tk.RIGHT)
+
+        button_frame = ttk.Frame(action_frame, style="CardInner.TFrame")
+        button_frame.pack(fill=tk.X)
+
         analyze_button = ttkb.Button(
             button_frame,
             text="Analyze Emails",
@@ -1066,8 +1101,8 @@ class EmailOrganizerGUI:
             bootstyle="primary",
             width=20
         )
-        analyze_button.pack(side=tk.LEFT, padx=10)
-        
+        analyze_button.pack(side=tk.LEFT, padx=(0, 10), pady=2)
+
         process_button = ttkb.Button(
             button_frame,
             text="Process Emails",
@@ -1075,31 +1110,60 @@ class EmailOrganizerGUI:
             bootstyle="success",
             width=20
         )
-        process_button.pack(side=tk.LEFT, padx=10)
-        
-        # Analytics content area with a card-like appearance
-        analytics_container = ttk.Frame(dashboard_frame, style="Card.TFrame")
-        analytics_container.pack(expand=True, fill=tk.BOTH, padx=20, pady=10)
-        
-        # Add a header to the analytics card
-        ttk.Label(
-            analytics_container, 
-            text="Email Analytics", 
-            font=("Helvetica", 14, "bold"),
-            style="CardTitle.TLabel"
-        ).pack(anchor=tk.W, padx=20, pady=(20, 10))
-        
-        self.analytics_frame = ttk.Frame(analytics_container)
-        self.analytics_frame.pack(expand=True, fill=tk.BOTH, padx=20, pady=(0, 20))
-        
-        # Add a placeholder message
-        placeholder = ttk.Label(
-            self.analytics_frame,
-            text="Your inbox insights will appear here. Connect your email, then select Analyze Emails.",
-            font=("Helvetica", 12),
-            foreground="#888888"
+        process_button.pack(side=tk.LEFT, padx=2, pady=2)
+
+        search_button = ttkb.Button(
+            button_frame, text="Search Inbox",
+            command=lambda: self.notebook.select(2),
+            bootstyle="secondary-outline", width=18
         )
-        placeholder.pack(expand=True)
+        search_button.pack(side=tk.LEFT, padx=2, pady=2)
+
+        # The analytics panel grows with the available window space.
+        analytics_container = ttk.Frame(
+            dashboard_frame, style="Card.TFrame", padding=18
+        )
+        analytics_container.pack(
+            expand=True, fill=tk.BOTH, padx=14, pady=(0, 8)
+        )
+
+        analytics_header = ttk.Frame(analytics_container, style="CardInner.TFrame")
+        analytics_header.pack(fill=tk.X, pady=(0, 12))
+
+        ttk.Label(
+            analytics_header,
+            text="Email Analytics",
+            style="CardTitle.TLabel"
+        ).pack(side=tk.LEFT)
+
+        ttk.Label(
+            analytics_header,
+            text="Your inbox overview",
+            style="CardHint.TLabel"
+        ).pack(side=tk.RIGHT)
+
+        self.analytics_frame = ttk.Frame(analytics_container, style="CardInner.TFrame")
+        self.analytics_frame.pack(expand=True, fill=tk.BOTH)
+
+        # A clear empty state guides first-time users toward the next action.
+        empty_state = ttk.Frame(self.analytics_frame, padding=24, style="InnerCard.TFrame")
+        empty_state.pack(expand=True, fill=tk.BOTH, padx=2, pady=2)
+        ttk.Label(
+            empty_state,
+            text="Your inbox insights will appear here",
+            font=("Segoe UI", 17, "bold"),
+            background=self.ui_colors["surface_alt"],
+            foreground=self.ui_colors["text"]
+        ).pack(expand=True, pady=(35, 4))
+        ttk.Label(
+            empty_state,
+            text="Connect your email account, then select Analyze Emails to generate analytics.",
+            font=("Segoe UI", 10),
+            background=self.ui_colors["surface_alt"],
+            foreground=self.ui_colors["muted"],
+            justify=tk.CENTER,
+            wraplength=480
+        ).pack(pady=(0, 35))
 
     def create_rules_tab(self):
         rules_frame = ttk.Frame(self.notebook)
@@ -1221,8 +1285,9 @@ class EmailOrganizerGUI:
         form_frame.pack(fill=tk.X, padx=20, pady=(0, 20))
         
         ttk.Label(form_frame, text="Search Term:").grid(row=0, column=0, padx=5, pady=10, sticky=tk.W)
-        search_entry = ttkb.Entry(form_frame, width=40, bootstyle="primary")
-        search_entry.grid(row=0, column=1, padx=5, pady=10, sticky=tk.W)
+        self.search_entry = ttkb.Entry(form_frame, width=40, bootstyle="primary")
+        self.search_entry.grid(row=0, column=1, padx=5, pady=10, sticky=tk.W)
+        self.search_entry.bind("<Return>", lambda event: self.search_emails(self.search_entry.get()))
         
         ttk.Label(form_frame, text="Time Period:").grid(row=1, column=0, padx=5, pady=10, sticky=tk.W)
         period_combo = ttkb.Combobox(
@@ -1237,7 +1302,7 @@ class EmailOrganizerGUI:
         search_button = ttkb.Button(
             form_frame,
             text="Search",
-            command=lambda: self.search_emails(search_entry.get()),
+            command=lambda: self.search_emails(self.search_entry.get()),
             bootstyle="primary",
             width=15
         )
@@ -1492,9 +1557,8 @@ class EmailOrganizerGUI:
         status_bar = ttk.Label(
             self.window, 
             textvariable=self.status_var, 
-            relief=tk.SUNKEN, 
             anchor=tk.W,
-            padding=(10, 5)
+            style="StatusBar.TLabel"
         )
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
@@ -1825,6 +1889,9 @@ class EmailOrganizerGUI:
             self.window.style.theme_use("superhero")
             self.is_dark_mode = True
             
+        self.apply_visual_styles()
+        self.status_var.set("Dark theme enabled." if self.is_dark_mode else "Light theme enabled.")
+
         # Update any open analytics
         if hasattr(self, 'analytics_frame') and len(self.analytics_frame.winfo_children()) > 0:
             # Re-display analytics with new theme
@@ -1945,32 +2012,9 @@ class EmailOrganizerGUI:
         self.status_var.set("Opening documentation in your web browser...")
 
     def run(self):
-        # Apply custom styles
-        style = ttkb.Style()
-        
-        # Card-like frames
-        style.configure("Card.TFrame", background="#ffffff" if not self.is_dark_mode else "#2a2a2a", 
-                       relief="solid", borderwidth=1)
-        style.configure("InnerCard.TFrame", background="#f8f9fa" if not self.is_dark_mode else "#343a40", 
-                       relief="solid", borderwidth=1)
-        
-        # Sidebar styling
-        style.configure("Sidebar.TFrame", background="#343a40")
-        style.configure("SidebarBtn.TFrame", background="#343a40")
-        style.configure("SidebarTitle.TLabel", background="#343a40", foreground="white")
-        style.configure("ConnectionStatus.TLabel", background="#343a40", foreground="#5cb85c")
-        
-        # Card titles
-        style.configure("CardTitle.TLabel", font=("Helvetica", 14, "bold"))
-        
-        # Colored frames for indicators
-        style.configure("Success.TFrame", background="#5cb85c")
-        style.configure("Info.TFrame", background="#5bc0de")
-        style.configure("Warning.TFrame", background="#f0ad4e")
-        style.configure("Danger.TFrame", background="#d9534f")
-        style.configure("Primary.TFrame", background="#0275d8")
-        
+        """Start the application event loop."""
         self.window.mainloop()
+
 
 
 if __name__ == "__main__":
