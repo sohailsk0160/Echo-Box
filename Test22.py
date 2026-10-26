@@ -106,17 +106,34 @@ class EmailOrganizer:
                 sender = email.utils.parseaddr(email_message['From'])[1]
                 analytics['sender_frequency'][sender] += 1
 
-                date_tuple = email.utils.parsedate_tz(email_message['Date'])
-                if date_tuple:
-                    local_date = datetime.fromtimestamp(email.utils.mktime_tz(date_tuple))
+                # Date headers can be missing or malformed. Keep the email in
+                # the overall analytics, but only calculate time-based metrics
+                # when a valid timestamp is available.
+                local_date = None
+                try:
+                    date_header = email_message.get('Date')
+                    date_tuple = email.utils.parsedate_tz(date_header) if date_header else None
+                    if date_tuple:
+                        local_date = datetime.fromtimestamp(
+                            email.utils.mktime_tz(date_tuple)
+                        )
+                except (TypeError, ValueError, OverflowError):
+                    local_date = None
+
+                if local_date is not None:
                     analytics['hourly_distribution'][local_date.hour] += 1
 
-                if email_message['In-Reply-To']:
-                    if last_received_time:
-                        response_time = (local_date - last_received_time).total_seconds() / 60
-                        total_response_time += response_time
-                        response_count += 1
-                last_received_time = local_date
+                    if email_message.get('In-Reply-To') and last_received_time is not None:
+                        response_time = (
+                            local_date - last_received_time
+                        ).total_seconds() / 60
+
+                        # Ignore negative intervals from messages arriving out of order.
+                        if response_time >= 0:
+                            total_response_time += response_time
+                            response_count += 1
+
+                    last_received_time = local_date
 
                 subject = email_message['Subject']
                 if subject:
@@ -232,14 +249,25 @@ class EmailOrganizer:
                 email_body = msg_data[0][1]
                 email_message = email.message_from_bytes(email_body)
 
-                subject = email_message['Subject']
-                sender = email.utils.parseaddr(email_message['From'])[1]
-                date = email.utils.parsedate_to_datetime(email_message['Date'])
+                subject = email_message.get('Subject', '(No subject)')
+                sender = email.utils.parseaddr(email_message.get('From', ''))[1]
+
+                # Search should still return the email when its Date header is
+                # absent or invalid.
+                formatted_date = 'Unknown'
+                try:
+                    parsed_date = email.utils.parsedate_to_datetime(
+                        email_message.get('Date', '')
+                    )
+                    if parsed_date is not None:
+                        formatted_date = parsed_date.strftime("%Y-%m-%d %H:%M:%S")
+                except (TypeError, ValueError, OverflowError):
+                    pass
 
                 results.append({
                     'subject': subject,
                     'sender': sender,
-                    'date': date.strftime("%Y-%m-%d %H:%M:%S")
+                    'date': formatted_date
                 })
 
             return results
